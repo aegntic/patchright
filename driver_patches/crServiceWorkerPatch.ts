@@ -23,21 +23,24 @@ export function patchCRServiceWorker(project: Project) {
 	const crServiceWorkerConstructorBody = crServiceWorkerConstructorDeclaration.getBodyOrThrow().asKindOrThrow(SyntaxKind.Block);
 		
 	// Find the Runtime.enable statement to remove
-	assertDefined(
-		crServiceWorkerConstructorBody
-			.getStatements()
-			.find((s) => s.getText().includes("session.send") && s.getText().includes("Runtime.enable"))
-	).remove();
+	crServiceWorkerConstructorBody
+		.getStatements()
+		.find((s) => s.getText().includes("session.send") && s.getText().includes("Runtime.enable"))
+		?.remove();
 
+	if (crServiceWorkerConstructorBody.getText().includes('expression: "globalThis"'))
+		return;
 	crServiceWorkerConstructorBody.addStatements(`
 		session._sendMayFail("Runtime.evaluate", {
 			expression: "globalThis",
 			serializationOptions: { serialization: "idOnly" }
 		}).then(globalThis => {
-			if (globalThis && globalThis.result) {
+			if (globalThis && globalThis.result && globalThis.result.objectId) {
 				var globalThisObjId = globalThis.result.objectId;
 				var executionContextId = parseInt(globalThisObjId.split(".")[1], 10);
-				this.createExecutionContext(new CRExecutionContext(session, { id: executionContextId }));
+				if (!isNaN(executionContextId)) {
+					this.createExecutionContext(new CRExecutionContext(session, { id: executionContextId }));
+				}
 			}
 		});
 	`);

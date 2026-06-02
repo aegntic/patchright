@@ -44,7 +44,7 @@ export function patchFrames(project: Project) {
 		const handle = await this.selectors.query(selector, { strict }, scope);
 		if (!handle)
 			throw new Error('Failed to find element matching selector "' + selector + '"');
-		const result = await handle.evaluateExpression(expression, { isFunction }, arg, true);
+		const result = await handle.internalEvaluateExpression(expression, { isFunction }, arg);
 		handle.dispose();
 		return result;
 	`);
@@ -62,7 +62,7 @@ export function patchFrames(project: Project) {
 			try {
 				isolatedContext = this.selectors._parseSelector(selector, { strict: false }).world !== "main" && isolatedContext;
 				const arrayHandle = await this.selectors.queryArrayInMainWorld(selector, scope, isolatedContext);
-				const result = await arrayHandle.evaluateExpression(expression, { isFunction }, arg, isolatedContext);
+				const result = await arrayHandle.internalEvaluateExpression(expression, { isFunction }, arg);
 				arrayHandle.dispose();
 				return result;
 			} catch (e) {
@@ -104,6 +104,17 @@ export function patchFrames(project: Project) {
 		const callback = (injectedScript, element, data) => {
 			injectedScript.dispatchEvent(element, data.type, data.eventInit);
 		};
+		if (eventInitHandles.length > 0 && selector !== ":scope") {
+			dom.assertDone(await this._retryWithProgressIfNotConnected(progress, selector, { strict: options.strict, performActionPreChecks: false }, async (progress, handle) => {
+				await handle.dispatchEvent(progress, type, eventInit);
+				return 'done' as const;
+			}));
+			return;
+		}
+		if (eventInitHandles.length === 0) {
+			await this._callOnElementOnceMatches(progress, selector, callback, { type, eventInit }, { ...options }, scope);
+			return;
+		}
 		try {
 			await this._callOnElementOnceMatches(progress, selector, callback, { type, eventInit }, { mainWorld: true, ...options }, scope);
 		} catch (e) {
@@ -118,25 +129,31 @@ export function patchFrames(project: Project) {
 	// -- querySelectorAll Method --
 	const querySelectorAllMethod = frameClass.getMethodOrThrow("querySelectorAll");
 	querySelectorAllMethod.setBodyText(`
-		const metadata = { internal: false, log: [], method: "querySelectorAll" };
-		const progress = {
-			log: message => metadata.log.push(message),
-			metadata,
-			race: (promise) => Promise.race(Array.isArray(promise) ? promise : [promise])
+		const continuePolling = Symbol("continuePolling");
+		let result;
+		try {
+			result = await this._retryWithoutProgress(progress, selector, {strict: null, performActionPreChecks: false}, async (result) => {
+				if (!result || !result[0]) return [];
+				return Array.isArray(result[1]) ? result[1] : [];
+			}, 'returnAll', continuePolling);
+		} catch (e: any) {
+			if ((e instanceof ReferenceError || e?.name === 'ReferenceError' || e?.message?.includes("element is not defined")) && e.message.includes("element is not defined"))
+				result = continuePolling;
+			else
+				throw e;
 		}
-		return await this._retryWithoutProgress(progress, selector, {strict: null, performActionPreChecks: false}, async (result) => {
-			if (!result || !result[0]) return [];
-			return Array.isArray(result[1]) ? result[1] : [];
-		}, 'returnAll', null);
+		return result === continuePolling ? await progress.race(this.selectors.queryAll(selector)) : result;
 	`);
 
 	// -- querySelector Method --
 	const querySelectorMethod = frameClass.getMethodOrThrow("querySelector");
 	querySelectorMethod.setBodyText(`
-		return this.querySelectorAll(selector, options).then((handles) => {
+		this.apiLog(\`    finding element using the selector "\${selector}"\`);
+		return this.querySelectorAll(progress, selector).then((handles) => {
 			if (handles.length === 0)
 				return null;
-			if (handles.length > 1 && options?.strict)
+			const strict = options?.strict ?? this._page.browserContext._options.strictSelectors;
+			if (handles.length > 1 && strict)
 				throw new Error(\`Strict mode: expected one element matching selector "\${selector}", found \${handles.length}\`);
 			return handles[0];
 		});
@@ -166,16 +183,18 @@ export function patchFrames(project: Project) {
 		  if (!resolvedNode?.object?.objectId)
 		    return 0;
 
-		  return parseInt(resolvedNode.object.objectId.split(".")[1], 10);
+		  const executionContextId = parseInt(resolvedNode.object.objectId.split(".")[1], 10);
+		  return isNaN(executionContextId) ? 0 : executionContextId;
 		} catch (e) {}
 		return 0;
 	`);
 
 	// -- _context Method --
-	const contextMethod = frameClass.getMethodOrThrow("_context");
+	const contextMethod = frameClass.getMethodOrThrow("context");
+	contextMethod.rename("_context");
 	contextMethod.setIsAsync(true);
 	contextMethod.setBodyText(`
-		if (this.isDetached())
+		if (this._isDetached())
 			throw new Error('Frame was detached');
 
 		let client;
@@ -210,12 +229,14 @@ export function patchFrames(project: Project) {
 					expression: "globalThis",
 					serializationOptions: { serialization: "idOnly" },
 				});
-				if (!globalThis) {
-					if (this.isDetached()) throw new Error('Frame was detached');
+				if (!globalThis || !globalThis?.result?.objectId) {
+					if (this._isDetached()) throw new Error('Frame was detached');
 					return;
 				}
 				const executionContextId = parseInt(globalThis.result.objectId.split('.')[1], 10);
-				this._mainWorld = registerContext(executionContextId, world);
+				if (!isNaN(executionContextId)) {
+					this._mainWorld = registerContext(executionContextId, world);
+				}
 			}
 		}
 
@@ -223,10 +244,10 @@ export function patchFrames(project: Project) {
 			const result = await client._sendMayFail('Page.createIsolatedWorld', {
 				frameId: this._id, grantUniveralAccess: true, worldName: world,
 			});
-			if (!result) {
-				if (this.isDetached()) throw new Error("Frame was detached");
-				return;
-			}
+				if (!result) {
+					if (this._isDetached()) throw new Error("Frame was detached");
+					return;
+				}
 			this._isolatedWorld = registerContext(result.executionContextId, "utility");
 		}
 
@@ -236,25 +257,33 @@ export function patchFrames(project: Project) {
 			return this._iframeWorld;
 		return this._mainWorld;
 	`);
+	frameClass.insertMethod(contextMethod.getChildIndex() + 1, {
+		name: "context",
+		parameters: [
+			{ name: "world", type: "types.World" },
+		],
+		returnType: "Promise<dom.FrameExecutionContext>",
+		statements: "return this._context(world);",
+	});
 
 	// -- _setContext Method --
 	const setContentMethod = frameClass.getMethodOrThrow("setContent");
 	setContentMethod.setBodyText(`
-    await this.raceNavigationAction(progress, async () => {
-      const waitUntil = options.waitUntil === void 0 ? "load" : options.waitUntil;
-      progress.log(\`setting frame content, waiting until "\${waitUntil}"\`);
-      const lifecyclePromise = new Promise((resolve, reject) => {
-        this._onClearLifecycle();
-        this.waitForLoadState(progress, waitUntil).then(resolve).catch(reject);
-      });
-      const setContentPromise = this._page.delegate._sessionForFrame(this)._client.send("Page.setDocumentContent", {
-        frameId: this._id,
-        html
-      });
-      await Promise.all([setContentPromise, lifecyclePromise]);
+		await this.raceNavigationAction(progress, async () => {
+			const waitUntil = options.waitUntil === void 0 ? "load" : options.waitUntil;
+			progress.log(\`setting frame content, waiting until "\${waitUntil}"\`);
+			const lifecyclePromise = new Promise((resolve, reject) => {
+				this._onClearLifecycle();
+				this.waitForLoadState(progress, waitUntil).then(resolve).catch(reject);
+			});
+			const setContentPromise = this._page.delegate._sessionForFrame(this)._client.send("Page.setDocumentContent", {
+				frameId: this._id,
+				html
+			});
+			await Promise.all([setContentPromise, lifecyclePromise]);
 
-      return null;
-    });
+			return null;
+		});
 	`);
 
 	// -- _retryWithProgressIfNotConnected Method --
@@ -268,20 +297,127 @@ export function patchFrames(project: Project) {
 	const retryParamNames = retryWithProgressIfNotConnectedMethod.getParameters().map(p => p.getName());
 	if (retryParamNames.includes("options") && !retryParamNames.includes("strict")) {
 		retryWithProgressIfNotConnectedMethod.setBodyText(`
-			if (!(options as any)?.__patchrightSkipRetryLogWaiting)
-				progress.log("waiting for " + this._asLocator(selector));
-			return this.retryWithProgressAndTimeouts(progress, [0, 20, 50, 100, 100, 500], async continuePolling => {
-				return this._retryWithoutProgress(progress, selector, options as any, action as any, returnAction, continuePolling);
+			progress.log(\`waiting for \${this._asLocator(selector)}\`);
+			const noAutoWaiting = (options as any).__testHookNoAutoWaiting ?? options.noAutoWaiting;
+			const performActionPreChecks = (options.performActionPreChecks ?? !options.force) && !noAutoWaiting;
+			return this.retryWithProgressAndTimeouts(progress, [0, 20, 50, 100, 100, 500], async (progress, continuePolling) => {
+				if (performActionPreChecks)
+					await this._page.performActionPreChecks(progress);
+
+				const resolved = await progress.race(this.selectors.resolveInjectedForSelector(selector, { strict: options.strict }));
+				if (!resolved) {
+					if (noAutoWaiting)
+						throw new dom.NonRecoverableDOMError('Element(s) not found');
+					return continuePolling;
+				}
+				const result = await progress.race(resolved.injected.evaluateHandle((injected, { info, callId }) => {
+					const elements = injected.querySelectorAll(info.parsed, document);
+					if (callId)
+						injected.markTargetElements(new Set(elements), callId);
+					const element = elements[0] as Element | undefined;
+					let log = '';
+					if (elements.length > 1) {
+						if (info.strict)
+							throw injected.strictModeViolationError(info.parsed, elements);
+						log = \`  locator resolved to \${elements.length} elements. Proceeding with the first one: \${injected.previewNode(elements[0])}\`;
+					} else if (element) {
+						log = \`  locator resolved to \${injected.previewNode(element)}\`;
+					}
+					injected.checkDeprecatedSelectorUsage(info.parsed, elements);
+					return { log, success: !!element, element };
+				}, { info: resolved.info, callId: progress.metadata.id }));
+				const { log, success } = await progress.race(result.evaluate(r => ({ log: r.log, success: r.success })));
+				if (log)
+					progress.log(log);
+				if (!success) {
+					result.dispose();
+					// Fallback to custom _retryWithoutProgress
+					const actionWithProgress = async (res) => action.length >= 2 ? action(progress, res as any) : (action as any)(res);
+					const retryRes = await this._retryWithoutProgress(progress, selector, { ...options, performActionPreChecks: false } as any, actionWithProgress as any, returnAction, continuePolling);
+					if (retryRes !== continuePolling)
+						return retryRes;
+
+					if (noAutoWaiting)
+						throw new dom.NonRecoverableDOMError('Element(s) not found');
+					return continuePolling;
+				}
+				const element = await progress.race(result.evaluateHandle(r => r.element)) as dom.ElementHandle<Element>;
+				result.dispose();
+				try {
+					const result = await action(progress, element);
+					if (result === 'error:notconnected') {
+						if (noAutoWaiting)
+							throw new dom.NonRecoverableDOMError('Element is not attached to the DOM');
+						progress.log('element was detached from the DOM, retrying');
+						return continuePolling;
+					}
+					return result;
+				} finally {
+					element?.dispose();
+				}
 			});
 		`);
 	} else if (retryParamNames.includes("strict") && retryParamNames.includes("performActionPreChecks")) {
 		retryWithProgressIfNotConnectedMethod.setBodyText(`
+			progress.log(\`waiting for \${this._asLocator(selector)}\`);
 			const normalizedOptions: any = { strict, performActionPreChecks };
+			const noAutoWaiting = (normalizedOptions as any).__testHookNoAutoWaiting ?? normalizedOptions.noAutoWaiting;
+			const performChecks = (normalizedOptions.performActionPreChecks ?? !normalizedOptions.force) && !noAutoWaiting;
+			return this.retryWithProgressAndTimeouts(progress, [0, 20, 50, 100, 100, 500], async (progress, continuePolling) => {
+				if (performChecks)
+					await this._page.performActionPreChecks(progress);
 
-			if (!(normalizedOptions as any)?.__patchrightSkipRetryLogWaiting)
-				progress.log("waiting for " + this._asLocator(selector));
-			return this.retryWithProgressAndTimeouts(progress, [0, 20, 50, 100, 100, 500], async continuePolling => {
-				return this._retryWithoutProgress(progress, selector, normalizedOptions, action as any, returnAction, continuePolling);
+				const resolved = await progress.race(this.selectors.resolveInjectedForSelector(selector, { strict }));
+				if (!resolved) {
+					if (noAutoWaiting)
+						throw new dom.NonRecoverableDOMError('Element(s) not found');
+					return continuePolling;
+				}
+				const result = await progress.race(resolved.injected.evaluateHandle((injected, { info, callId }) => {
+					const elements = injected.querySelectorAll(info.parsed, document);
+					if (callId)
+						injected.markTargetElements(new Set(elements), callId);
+					const element = elements[0] as Element | undefined;
+					let log = '';
+					if (elements.length > 1) {
+						if (info.strict)
+							throw injected.strictModeViolationError(info.parsed, elements);
+						log = \`  locator resolved to \${elements.length} elements. Proceeding with the first one: \${injected.previewNode(elements[0])}\`;
+					} else if (element) {
+						log = \`  locator resolved to \${injected.previewNode(element)}\`;
+					}
+					injected.checkDeprecatedSelectorUsage(info.parsed, elements);
+					return { log, success: !!element, element };
+				}, { info: resolved.info, callId: progress.metadata.id }));
+				const { log, success } = await progress.race(result.evaluate(r => ({ log: r.log, success: r.success })));
+				if (log)
+					progress.log(log);
+				if (!success) {
+					result.dispose();
+					// Fallback to custom _retryWithoutProgress
+					const actionWithProgress = async (res) => action.length >= 2 ? action(progress, res as any) : (action as any)(res);
+					const retryRes = await this._retryWithoutProgress(progress, selector, { ...normalizedOptions, performActionPreChecks: false }, actionWithProgress as any, returnAction, continuePolling);
+					if (retryRes !== continuePolling)
+						return retryRes;
+
+					if (noAutoWaiting)
+						throw new dom.NonRecoverableDOMError('Element(s) not found');
+					return continuePolling;
+				}
+				const element = await progress.race(result.evaluateHandle(r => r.element)) as dom.ElementHandle<Element>;
+				result.dispose();
+				try {
+					const result = await action(progress, element);
+					if (result === 'error:notconnected') {
+						if (noAutoWaiting)
+							throw new dom.NonRecoverableDOMError('Element is not attached to the DOM');
+						progress.log('element was detached from the DOM, retrying');
+						return continuePolling;
+					}
+					return result;
+				} finally {
+					element?.dispose();
+				}
 			});
 		`);
 	} else {
@@ -320,8 +456,8 @@ export function patchFrames(project: Project) {
 			return continuePolling;
 		}
 
-		const utilityContext = await resolved.frame._utilityContext();
-		const mainContext = await resolved.frame._mainContext();
+		const utilityContext = await resolved.frame.utilityContext();
+		const mainContext = await resolved.frame.mainContext();
 		let client;
 		try {
 			client = this._page.delegate._sessionForFrame(resolved.frame)._client;
@@ -453,64 +589,75 @@ export function patchFrames(project: Project) {
 			throw new Error('options.visibility is not supported, did you mean options.state?');
 		if ((options as any).waitFor && (options as any).waitFor !== 'visible')
 			throw new Error('options.waitFor is not supported, did you mean options.state?');
-
 		const { state = 'visible' } = options;
 		if (!['attached', 'detached', 'visible', 'hidden'].includes(state))
 			throw new Error(\`state: expected one of (attached|detached|visible|hidden)\`);
-
 		if (performActionPreChecksAndLog)
 			progress.log(\`waiting for \${this._asLocator(selector)}\${state === 'attached' ? '' : ' to be ' + state}\`);
-
-		const promise = this._retryWithProgressIfNotConnected(progress, selector, { ...options, performActionPreChecks: true, __patchrightWaitForSelector: true, __patchrightInitialScope: scope }, async handle => {
-			if (scope) {
-				const scopeIsConnected = await scope.evaluateInUtility(([injected, node]) => node.isConnected, {}).catch(() => false);
-				if (scopeIsConnected !== true) {
-					if (state === 'hidden' || state === 'detached')
-						return null;
-					throw new dom.NonRecoverableDOMError('Element is not attached to the DOM');
-				}
+		const promise = this.retryWithProgressAndBackoff(progress, async (progress, continuePolling) => {
+			if (performActionPreChecksAndLog)
+				await this._page.performActionPreChecks(progress);
+			const resolved = await progress.race(this.selectors.resolveInjectedForSelector(selector, options, scope));
+			if (!resolved) {
+				if (state === 'hidden' || state === 'detached')
+					return null;
+				return continuePolling;
 			}
-
-			const attached = !!handle;
-			var visible = false;
-
-			if (attached) {
-				if (handle.parentNode instanceof dom.ElementHandle) {
-					visible = await handle.parentNode.evaluateInUtility(([injected, node, { handle }]) => {
-						return handle ? injected.utils.isElementVisible(handle) : false;
-					}, { handle });
-				} else {
-					visible = await handle.parentNode.evaluate((injected, { handle }) => {
-						return handle ? injected.utils.isElementVisible(handle) : false;
-					}, { handle });
-				}
-			}
-
-			const success = {
-				attached,
-				detached: !attached,
-				visible,
-				hidden: !visible
-			}[state];
-			if (!success) return "internal:continuepolling";
-			if (options.omitReturnValue) return null;
-
-			const element = state === 'attached' || state === 'visible' ? handle : null;
-			if (!element) return null;
-			if (options.__testHookBeforeAdoptNode) await options.__testHookBeforeAdoptNode();
+			if ((state === 'hidden' || state === 'detached') && resolved.frame._isDetached())
+				return null;
+			let result;
 			try {
-				return element;
+				result = await progress.race(resolved.injected.evaluateHandle((injected, { info, root, state }) => {
+				if (root && !root.isConnected) {
+					if (state === 'hidden' || state === 'detached')
+						return { log: '', element: undefined, visible: false, attached: false };
+					throw injected.createStacklessError('Element is not attached to the DOM');
+				}
+				const elements = injected.querySelectorAll(info.parsed, root || document);
+				const element = elements[0];
+				const visible = element ? injected.utils.isElementVisible(element) : false;
+				let log = '';
+				if (elements.length > 1) {
+					if (info.strict)
+						throw injected.strictModeViolationError(info.parsed, elements);
+					log = "  locator resolved to " + elements.length + " elements. Proceeding with the first one: " + injected.previewNode(elements[0]);
+				} else if (element) {
+					log = "  locator resolved to " + (visible ? 'visible' : 'hidden') + " " + injected.previewNode(element);
+				}
+				injected.checkDeprecatedSelectorUsage(info.parsed, elements);
+				return { log, element, visible, attached: !!element };
+				}, { info: resolved.info, root: resolved.frame === this ? scope : undefined, state }));
 			} catch (e) {
-				return "internal:continuepolling";
+				if ((state === 'hidden' || state === 'detached') && resolved.frame._isDetached())
+					return null;
+				throw e;
 			}
-		}, "returnOnNotResolved");
-
-		const resultPromise = scope ? scope._context._raceAgainstContextDestroyed(promise) : promise;
-		return resultPromise.catch(e => {
-			if (this.isDetached() && (e as any)?.message?.includes('Execution context was destroyed'))
-				throw new Error('Frame was detached');
-			throw e;
+			const { log, visible, attached } = await progress.race(result.evaluate(r => ({ log: r.log, visible: r.visible, attached: r.attached })));
+			if (log)
+				progress.log(log);
+			const success = { attached, detached: !attached, visible, hidden: !visible }[state];
+			if (!success) {
+				result.dispose();
+				return continuePolling;
+			}
+			if (options.omitReturnValue) {
+				result.dispose();
+				return null;
+			}
+			const element = state === 'attached' || state === 'visible' ? await progress.race(result.evaluateHandle(r => r.element)) : null;
+			result.dispose();
+			if (!element)
+				return null;
+			if ((options as any).__testHookBeforeAdoptNode)
+				await progress.race((options as any).__testHookBeforeAdoptNode());
+			try {
+				const mainContext = await progress.race(resolved.frame.mainContext());
+				return await progress.race(element._adoptTo(mainContext));
+			} catch (e) {
+				return continuePolling;
+			}
 		});
+		return scope ? scope._context.raceAgainstContextDestroyed(promise) : promise;
 	`);
 
 	// -- waitForFunctionExpression Method --
@@ -536,53 +683,42 @@ export function patchFrames(project: Project) {
 	const isVisibleInternalMethod = frameClass.getMethodOrThrow("isVisibleInternal");
 	isVisibleInternalMethod.setBodyText(`
 		try {
-			const metadata = { internal: false, log: [], method: "isVisible" };
-			const progress = {
-				log: message => metadata.log.push(message),
+			const metadata: any = { internal: false, log: [], method: 'isVisible' };
+			const progress2: any = {
+				log: (message: string) => metadata.log.push(message),
 				metadata,
-				race: (promise) => Promise.race(Array.isArray(promise) ? promise : [promise])
-			}
-			progress.log("waiting for " + this._asLocator(selector));
-			if (selector === ":scope") {
-				const scopeParentNode = scope.parentNode || scope;
+				race: (promise: any) => Promise.race(Array.isArray(promise) ? promise : [promise]),
+			};
+			progress2.log(\`waiting for \${this._asLocator(selector)}\`);
+			if (selector === ':scope') {
+				const scopeParentNode = (scope as any).parentNode || scope;
 				if (scopeParentNode instanceof dom.ElementHandle) {
-					return await scopeParentNode.evaluateInUtility(([injected, node, { scope: handle2 }]) => {
-						const state = handle2 ? injected.elementState(handle2, "visible") : {
-							matches: false,
-							received: "error:notconnected"
-						};
+					return await scopeParentNode.evaluateInUtility(([injected, node, { scope: handle }]) => {
+						const state = handle ? injected.elementState(handle, "visible") : { matches: false, received: "error:notconnected" };
 						return state.matches;
 					}, { scope });
 				} else {
-					return await scopeParentNode.evaluate((injected, node, { scope: handle2 }) => {
-						const state = handle2 ? injected.elementState(handle2, "visible") : {
-							matches: false,
-							received: "error:notconnected"
-						};
+					return await scopeParentNode.evaluate((injected, node, { scope: handle }) => {
+						const state = handle ? injected.elementState(handle, "visible") : { matches: false, received: "error:notconnected" };
 						return state.matches;
 					}, { scope });
 				}
 			} else {
-				return await this._retryWithoutProgress(progress, selector, { ...options, performActionPreChecks: false}, async (handle) => {
-					if (!handle) return false;
+				return await this._retryWithoutProgress(progress2, selector, { ...options, performActionPreChecks: false }, async (handle) => {
+					if (!handle)
+						return false;
 					if (handle.parentNode instanceof dom.ElementHandle) {
 						return await handle.parentNode.evaluateInUtility(([injected, node, { handle: handle2 }]) => {
-							const state = handle2 ? injected.elementState(handle2, "visible") : {
-								matches: false,
-								received: "error:notconnected"
-							};
+							const state = handle2 ? injected.elementState(handle2, "visible") : { matches: false, received: "error:notconnected" };
 							return state.matches;
 						}, { handle });
 					} else {
 						return await handle.parentNode.evaluate((injected, { handle: handle2 }) => {
-							const state = handle2 ? injected.elementState(handle2, "visible") : {
-								matches: false,
-								received: "error:notconnected"
-							};
+							const state = handle2 ? injected.elementState(handle2, "visible") : { matches: false, received: "error:notconnected" };
 							return state.matches;
 						}, { handle });
 					}
-				}, "returnOnNotResolved", null);
+				}, 'returnOnNotResolved', null as any) as boolean;
 			}
 		} catch (e) {
 			if (this.isNonRetriableError(e)) throw e;
@@ -640,108 +776,56 @@ export function patchFrames(project: Project) {
 	// -- queryCount Method --
 	const queryCountMethod = frameClass.getMethodOrThrow("queryCount");
 	queryCountMethod.setBodyText(`
-		const metadata = { internal: false, log: [], method: "queryCount" };
-		const progress = {
-			log: message => metadata.log.push(message),
-			metadata,
-			race: (promise) => Promise.race(Array.isArray(promise) ? promise : [promise])
-		}
-		return await this._retryWithoutProgress(progress, selector, {strict: null, performActionPreChecks: false }, async (result) => {
+		const continuePolling = Symbol("continuePolling");
+		const result = await this._retryWithoutProgress(progress, selector, {strict: null, performActionPreChecks: false }, async (result) => {
 			if (!result || !result[0])
 				return 0;
 			return Array.isArray(result[1]) ? result[1].length : 0;
-		}, 'returnAll', null);
+		}, 'returnAll', continuePolling);
+		return result === continuePolling ? await this.selectors.queryCount(selector, options) : result;
 	`);
 
 	// -- _expectInternal Method --
 	const expectInternalMethod = frameClass.getMethodOrThrow("_expectInternal");
 	expectInternalMethod.setBodyText(`
+		const progressLog = (text: string) => progress.log(text);
+		const callId = progress.metadata.id;
 		// The first expect check, a.k.a. one-shot, always finishes - even when progress is aborted.
-		const race = (p) => noAbort ? p : progress.race(p);
-		const isArray = options.expression === 'to.have.count' || options.expression.endsWith('.array');
-		var log, matches, received, missingReceived;
-		if (selector) {
-			var frame, info;
-			try {
-				var { frame, info } = await race(this.selectors.resolveFrameForSelector(selector, { strict: true }));
-			} catch (e) { }
-			const action = async result => {
-				if (!result) {
-					if (options.expectedNumber === 0)
-						return { matches: true };
-					if (options.isNot && options.expectedNumber)
-						return { matches: false, received: 0 };
-					// expect(locator).toBeHidden() passes when there is no element.
-					if (!options.isNot && options.expression === 'to.be.hidden')
-						return { matches: true };
-					// expect(locator).not.toBeVisible() passes when there is no element.
-					if (options.isNot && options.expression === 'to.be.visible')
-						return { matches: false };
-					// expect(locator).toBeAttached({ attached: false }) passes when there is no element.
-					if (!options.isNot && options.expression === 'to.be.detached')
-						return { matches: true };
-					// expect(locator).not.toBeAttached() passes when there is no element.
-					if (options.isNot && options.expression === 'to.be.attached')
-						return { matches: false };
-					// expect(locator).not.toBeInViewport() passes when there is no element.
-					if (options.isNot && options.expression === 'to.be.in.viewport')
-						return { matches: false };
-					// expect(locator).toHaveText([]) pass when there is no element.
-					if (options.expression === "to.have.text.array") {
-						if (options.expectedText.length === 0)
-							return { matches: true, received: [] };
-						if (options.isNot && options.expectedText.length !== 0)
-							return { matches: false, received: [] };
-					}
-					// When none of the above applies, expect does not match.
-					return { matches: options.isNot, missingReceived: true };
-				}
+		if (noAbort)
+			progress = nullProgress;
+		const selectorInFrame = selector ? await progress.race(this.selectors.resolveFrameForSelector(selector, { strict: true })) : undefined;
 
-				const handle = result[0];
-				const handles = result[1];
+		const { frame, info } = selectorInFrame || { frame: this, info: undefined };
+		const world = options.expression === 'to.have.property' ? 'main' : (info?.world ?? 'utility');
+		const context = await progress.race(frame.context(world));
+		const injected = await progress.race(context.injectedScript());
 
-				if (handle.parentNode instanceof dom.ElementHandle) {
-					return await handle.parentNode.evaluateInUtility(async ([injected, node, { handle, options, handles }]) => {
-						return await injected.expect(handle, options, handles);
-					}, { handle, options, handles });
-				} else {
-					return await handle.parentNode.evaluate(async (injected, { handle, options, handles }) => {
-						return await injected.expect(handle, options, handles);
-					}, { handle, options, handles });
-				}
-			}
-
-			if (noAbort) {
-				var { log, matches, received, missingReceived } = await this._retryWithoutProgress(progress, selector, {strict: !isArray, performActionPreChecks: false}, action, 'returnAll', null);
-			} else {
-				var { log, matches, received, missingReceived } = await race(this._retryWithProgressIfNotConnected(progress, selector, { strict: !isArray, performActionPreChecks: false, __patchrightSkipRetryLogWaiting: true } as any, action, 'returnAll'));
-			}
-		} else {
-			const world = options.expression === 'to.have.property' ? 'main' : 'utility';
-			const context = await race(this._context(world));
-			const injected = await race(context.injectedScript());
-			var { matches, received, missingReceived } = await race(injected.evaluate(async (injected, { options, callId }) => {
-				return { ...await injected.expect(undefined, options, []) };
-			}, { options, callId: progress.metadata.id }));
-		}
-
+		const { log, matches, received, missingReceived } = await progress.race(injected.evaluate(async (injected, { info, options, callId }) => {
+			const elements = info ? injected.querySelectorAll(info.parsed, document) : [];
+			if (callId)
+				injected.markTargetElements(new Set(elements), callId);
+			const isArray = options.expression === 'to.have.count' || options.expression.endsWith('.array');
+			let log = '';
+			if (isArray)
+				log = "  locator resolved to " + elements.length + " element" + (elements.length === 1 ? "" : "s");
+			else if (elements.length > 1)
+				throw injected.strictModeViolationError(info!.parsed, elements);
+			else if (elements.length)
+				log = "  locator resolved to " + injected.previewNode(elements[0]);
+			if (info)
+				injected.checkDeprecatedSelectorUsage(info.parsed, elements);
+			return { log, ...await injected.expect(elements[0], options, elements) };
+		}, { info, options, callId }));
 
 		if (log)
-			progress.log(log);
+			progressLog(log);
 		// Note: missingReceived avoids \`unexpected value "undefined"\` when element was not found.
 		if (matches === options.isNot) {
-			if (missingReceived) {
-				lastIntermediateResult.errorMessage = 'Error: element(s) not found';
-			} else {
-				lastIntermediateResult.errorMessage = undefined;
-				lastIntermediateResult.received = received;
-			}
+			lastIntermediateResult.errorMessage = missingReceived ? 'Error: element(s) not found' : undefined;
+			lastIntermediateResult.received = received;
 			lastIntermediateResult.isSet = true;
-			if (!missingReceived) {
-				const rendered = renderUnexpectedValue(options.expression, received);
-				if (rendered !== undefined)
-					progress.log('  unexpected value "' + rendered + '"');
-			}
+			if (!missingReceived && !Array.isArray(received?.value))
+				progressLog('  unexpected value "' + renderUnexpectedValue(options.expression, received?.value) + '"');
 		}
 		return { matches, received };
 	`);
@@ -751,22 +835,78 @@ export function patchFrames(project: Project) {
 	callOnElementOnceMatchesMethod.setBodyText(`
 		const callbackText = body.toString();
 		progress.log("waiting for " + this._asLocator(selector));
+		const eventInit = (taskData as any)?.eventInit;
+		const eventInitContainsHandle = (value: unknown): boolean => {
+			if (!value || typeof value !== "object")
+				return false;
+			if (value instanceof js.JSHandle)
+				return true;
+			if (Array.isArray(value))
+				return value.some(eventInitContainsHandle);
+			return Object.values(value).some(eventInitContainsHandle);
+		};
+		if (!options?.mainWorld && !eventInitContainsHandle(eventInit)) {
+			const promise = this.retryWithProgressAndBackoff(progress, async (progress, continuePolling) => {
+				const resolved = await progress.race(this.selectors.resolveInjectedForSelector(selector, options, scope));
+				if (!resolved)
+					return continuePolling;
+				const { log, success, value } = await progress.race(resolved.injected.evaluate((injected, { info, callbackText, taskData, callId, root }) => {
+					const callback = injected.eval(callbackText);
+					const element = injected.querySelector(info.parsed, root || document, info.strict);
+					if (!element)
+						return { success: false };
+					const log = "  locator resolved to " + injected.previewNode(element);
+					if (callId)
+						injected.markTargetElements(new Set([element]), callId);
+					return { log, success: true, value: callback(injected, element, taskData) };
+				}, { info: resolved.info, callbackText, taskData, callId: progress.metadata.id, root: resolved.frame === this ? scope : undefined }));
+				if (log)
+					progress.log(log);
+				if (!success)
+					return continuePolling;
+				return value;
+			});
+			return scope ? scope._context.raceAgainstContextDestroyed(promise) : promise;
+		}
+		if (options?.mainWorld && eventInitContainsHandle(eventInit)) {
+			const promise = this.retryWithProgressAndBackoff(progress, async (progress, continuePolling) => {
+				const resolved = await progress.race(this.selectors.resolveInjectedForSelector(selector, options, scope));
+				if (!resolved)
+					return continuePolling;
+				const { log, success, value } = await progress.race(resolved.injected.evaluate((injected, { info, callbackText, taskData, callId, root }) => {
+					const callback = injected.eval(callbackText);
+					const element = injected.querySelector(info.parsed, root || document, info.strict);
+					if (!element)
+						return { success: false };
+					const log = "  locator resolved to " + injected.previewNode(element);
+					if (callId)
+						injected.markTargetElements(new Set([element]), callId);
+					return { log, success: true, value: callback(injected, element, taskData) };
+				}, { info: resolved.info, callbackText, taskData, callId: progress.metadata.id, root: resolved.frame === this ? scope : undefined }));
+				if (log)
+					progress.log(log);
+				if (!success)
+					return continuePolling;
+				return value;
+			});
+			return scope ? scope._context.raceAgainstContextDestroyed(promise) : promise;
+		}
 		var promise;
 		if (selector === ":scope") {
 			const scopeParentNode = scope.parentNode || scope;
 			if (scopeParentNode instanceof dom.ElementHandle) {
 				if (options?.mainWorld) {
 					promise = (async () => {
-						const mainContext = await this._mainContext();
+						const mainContext = await this.mainContext();
 						const adoptedScope = await this._page.delegate.adoptElementHandle(scope, mainContext);
 						try {
-							return await mainContext.evaluate(([injected, node, { callbackText: callbackText2, scope: handle2, taskData: taskData2 }]) => {
+							return await mainContext.evaluate(([injected, node, { callbackText: callbackText2, taskData: taskData2 }]) => {
 								const callback = injected.eval(callbackText2);
-								return callback(injected, handle2, taskData2);
+								return callback(injected, node, taskData2);
 							}, [
 								await mainContext.injectedScript(),
 								adoptedScope,
-								{ callbackText, scope: adoptedScope, taskData },
+								{ callbackText, taskData },
 							]);
 						} finally {
 							adoptedScope.dispose();
@@ -775,7 +915,7 @@ export function patchFrames(project: Project) {
 				} else {
 					promise = scopeParentNode.evaluateInUtility(([injected, node, { callbackText: callbackText2, scope: handle2, taskData: taskData2 }]) => {
 						const callback = injected.eval(callbackText2);
-						return callback(injected, handle2, taskData2);
+						return callback(injected, node, taskData2);
 					}, {
 						callbackText,
 						scope,
@@ -794,19 +934,19 @@ export function patchFrames(project: Project) {
 			}
 		} else {
 
-			promise = this._retryWithProgressIfNotConnected(progress, selector, { ...options, performActionPreChecks: false }, async (handle) => {
+			promise = this._retryWithProgressIfNotConnected(progress, selector, { ...options, performActionPreChecks: false }, async (progress, handle) => {
 				if (handle.parentNode instanceof dom.ElementHandle) {
 					if (options?.mainWorld) {
-						const mainContext = await handle._frame._mainContext();
+						const mainContext = await handle._frame.mainContext();
 						const adoptedHandle = await this._page.delegate.adoptElementHandle(handle, mainContext);
 						try {
-							return await mainContext.evaluate(([injected, node, { callbackText: callbackText2, handle: handle2, taskData: taskData2 }]) => {
+							return await mainContext.evaluate(([injected, node, { callbackText: callbackText2, taskData: taskData2 }]) => {
 								const callback = injected.eval(callbackText2);
-								return callback(injected, handle2, taskData2);
+								return callback(injected, node, taskData2);
 							}, [
 								await mainContext.injectedScript(),
 								adoptedHandle,
-								{ callbackText, handle: adoptedHandle, taskData },
+								{ callbackText, taskData },
 							]);
 						} finally {
 							adoptedHandle.dispose();
@@ -818,13 +958,13 @@ export function patchFrames(project: Project) {
 					if (taskScope) {
 						const taskScopeContext = taskScope._context;
 						const adoptedHandle = await handle._adoptTo(taskScopeContext);
-						return await taskScopeContext.evaluate(([injected, node, { callbackText: callbackText2, adoptedHandle: handle2, taskData: taskData2 }]) => {
+						return await taskScopeContext.evaluate(([injected, node, { callbackText: callbackText2, taskData: taskData2 }]) => {
 							const callback = injected.eval(callbackText2);
-							return callback(injected, handle2, taskData2);
+							return callback(injected, node, taskData2);
 						}, [
 							await taskScopeContext.injectedScript(),
 							adoptedHandle,
-							{ callbackText, adoptedHandle, taskData },
+							{ callbackText, taskData },
 						]);
 					}
 
@@ -848,7 +988,7 @@ export function patchFrames(project: Project) {
 				}
 			})
 		}
-		return scope ? scope._context._raceAgainstContextDestroyed(promise) : promise;
+		return scope ? scope._context.raceAgainstContextDestroyed(promise) : promise;
 	`);
 
 	// -- _customFindElementsByParsed Method --
@@ -867,6 +1007,7 @@ export function patchFrames(project: Project) {
 	const customFindElementsByParsedMethod = frameClass.getMethodOrThrow("_customFindElementsByParsed");
 	customFindElementsByParsedMethod.setBodyText(`
 		var parsedEdits = { ...parsed };
+		progress = progress || nullProgress;
 		// Note: We start scoping at document level
 		var currentScopingElements = [documentScope];
 
@@ -934,7 +1075,7 @@ export function patchFrames(project: Project) {
 					// Elements Queryed in the "current round"
 					const queryGroups: { handles: any; parentNode: any }[] = [];
 					for (var shadowRoot of shadowRoots) {
-						const shadowHandles = await shadowRoot.evaluateHandleInUtility(
+						const shadowHandles = await (shadowRoot as any)._evaluateHandleInUtility(
 							([injected, node, { parsed, callId }]) => {
 							 	const elements = injected.querySelectorAll(parsed, node);
 								if (callId)
@@ -949,7 +1090,7 @@ export function patchFrames(project: Project) {
 					}
 
 					// Document Root Elements (not in CSR)
-					const rootHandles = await scope.evaluateHandleInUtility(
+					const rootHandles = await (scope as any)._evaluateHandleInUtility(
 						([injected, node, { parsed, callId }]) => {
 						 	const elements = injected.querySelectorAll(parsed, node);
 							if (callId)
@@ -964,15 +1105,16 @@ export function patchFrames(project: Project) {
 
 					// Querying and Sorting the elements by their backendNodeId
 					for (const { handles, parentNode } of queryGroups) {
-						const handlesAmount = await (await handles.getProperty("length")).jsonValue();
+						const handlesAmount = await (await handles.getProperty(progress, "length")).jsonValue(progress);
 						for (var i = 0; i < handlesAmount; i++) {
+							let element;
 						  if (parentNode instanceof dom.ElementHandle) {
-								var element = await parentNode.evaluateHandleInUtility(
+								element = await (parentNode as any)._evaluateHandleInUtility(
 									([injected, node, { i, handles: elems }]) => elems[i],
 									{ i, handles }
 								);
 							} else {
-								var element = await parentNode.evaluateHandle(
+								element = await parentNode.evaluateHandle(
 									(injected, { i, handles: elems }) => elems[i],
 									{ i, handles }
 								);
